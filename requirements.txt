@@ -1,0 +1,5 @@
+flask
+faiss-cpu
+numpy
+fastembed
+waitress
