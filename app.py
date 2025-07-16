@@ -4,34 +4,46 @@ import faiss
 import numpy as np
 import fastembed
 import os
+import sqlite3
 import json
 
 app = Flask(__name__)
 
-# Load embedding model
 model = fastembed.TextEmbedding('BAAI/bge-small-en-v1.5')
-embedding_dim = len(list(model.embed(["test"]))[0]) 
+embedding_dim = len(list(model.embed(["test"]))[0])
 
 # Paths
 INDEX_FILE = "vector.index"
-TEXTS_FILE = "texts.json"
+DB_FILE = "chunks.db"
 
-# Load or initialize FAISS index
+# Load or create FAISS index
 if os.path.exists(INDEX_FILE):
     index = faiss.read_index(INDEX_FILE)
-    print("Loaded FAISS index from disk.")
 else:
     index = faiss.IndexFlatL2(embedding_dim)
-    print("Initialized empty FAISS index.")
 
-# Load or initialize texts
-if os.path.exists(TEXTS_FILE):
-    with open(TEXTS_FILE, 'r') as f:
-        texts = json.load(f)
-    print(f"Loaded {len(texts)} text chunks.")
-else:
-    texts = []
-    print("Initialized empty texts list.")
+# SQLite setup
+conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL
+)
+''')
+conn.commit()
+
+def store_texts(chunks):
+    cursor.executemany('INSERT INTO chunks (text) VALUES (?)', [(chunk,) for chunk in chunks])
+    conn.commit()
+    ids = cursor.execute('SELECT last_insert_rowid()').fetchone()[0]
+    start_id = ids - len(chunks) + 1
+    return list(range(start_id, ids + 1))
+
+def fetch_texts_by_ids(ids):
+    placeholders = ','.join(['?'] * len(ids))
+    cursor.execute(f'SELECT text FROM chunks WHERE id IN ({placeholders})', ids)
+    return [row[0] for row in cursor.fetchall()]
 
 @app.route('/add_chunks', methods=['POST'])
 def add_chunks():
@@ -41,16 +53,17 @@ def add_chunks():
     if not isinstance(chunks, list) or not all(isinstance(chunk, str) for chunk in chunks):
         return jsonify({'error': 'Invalid input. Expected list of strings.'}), 400
 
+    # Generate embeddings
     embeddings = list(model.embed(chunks))
-
     index.add(np.array(embeddings).astype('float32'))
-    texts.extend(chunks)
 
+    # Store chunks in SQLite
+    ids = store_texts(chunks)
+
+    # Save index after batch
     faiss.write_index(index, INDEX_FILE)
-    with open(TEXTS_FILE, 'w') as f:
-        json.dump(texts, f)
 
-    return jsonify({'status': 'chunks added', 'total_chunks': len(texts)})
+    return jsonify({'status': 'chunks added', 'added_count': len(ids)})
 
 @app.route('/search', methods=['POST'])
 def search():
@@ -60,29 +73,21 @@ def search():
     if not query.strip():
         return jsonify({'error': 'Empty query string.'}), 400
 
-    if index.ntotal == 0 or len(texts) == 0:
-        return jsonify({'results': [], 'message': 'No data in index.'}), 200
+    if index.ntotal == 0:
+        return jsonify({'results': [], 'message': 'No data available in index.'}), 200
 
-    embedding = np.array(list(model.embed([query]))).astype('float32')  # ✅ FIXED
+    embedding = np.array(list(model.embed([query]))).astype('float32')
+    D, I = index.search(embedding, min(k, index.ntotal))
 
-    try:
-        D, I = index.search(embedding, min(k, index.ntotal))
-        results = [texts[i] for i in I[0] if 0 <= i < len(texts)]
-        return jsonify({'results': results})
-    except Exception as e:
-        print(f"SEARCH ERROR: {e}")
-        return jsonify({'error': 'Vector search failed.', 'details': str(e)}), 500
+    ids = [int(idx) + 1 for idx in I[0]]  # SQLite rowid starts from 1
+    results = fetch_texts_by_ids(ids)
 
-    
+    return jsonify({'results': results})
+
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({
-        'status': 'OK',
-        'vectors_in_index': index.ntotal,
-        'texts_stored': len(texts)
-    })
-
-
+    total_chunks = cursor.execute('SELECT COUNT(*) FROM chunks').fetchone()[0]
+    return jsonify({'status': 'OK', 'vectors_in_index': index.ntotal, 'texts_stored': total_chunks})
 
 if __name__ == '__main__':
     serve(app, host='0.0.0.0', port=5001)
