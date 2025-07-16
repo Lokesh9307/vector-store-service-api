@@ -10,7 +10,7 @@ app = Flask(__name__)
 
 # Load embedding model
 model = fastembed.TextEmbedding('BAAI/bge-small-en-v1.5')
-embedding_dim = len(model.embed(["test"])[0])  # Auto-detect dimension
+embedding_dim = len(list(model.embed(["test"]))[0]) 
 
 # Paths
 INDEX_FILE = "vector.index"
