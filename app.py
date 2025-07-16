@@ -57,16 +57,13 @@ def search():
     query = request.json.get('query', '')
     k = int(request.json.get('top_k', 3))
 
-    print(f"SEARCH REQUEST: query='{query}', index.ntotal={index.ntotal}, texts_count={len(texts)}")
-
     if not query.strip():
         return jsonify({'error': 'Empty query string.'}), 400
 
     if index.ntotal == 0 or len(texts) == 0:
-        print("ERROR: Empty index or texts. Returning empty result.")
         return jsonify({'results': [], 'message': 'No data in index.'}), 200
 
-    embedding = np.array(model.embed([query])).astype('float32')
+    embedding = np.array(list(model.embed([query]))).astype('float32')  # ✅ FIXED
 
     try:
         D, I = index.search(embedding, min(k, index.ntotal))
@@ -75,6 +72,7 @@ def search():
     except Exception as e:
         print(f"SEARCH ERROR: {e}")
         return jsonify({'error': 'Vector search failed.', 'details': str(e)}), 500
+
     
 @app.route('/health', methods=['GET'])
 def health():
