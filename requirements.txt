@@ -3,5 +3,3 @@ faiss-cpu
 numpy
 fastembed
 waitress
-sqlite3
-requests
