@@ -57,25 +57,34 @@ def search():
     query = request.json.get('query', '')
     k = int(request.json.get('top_k', 3))
 
+    print(f"SEARCH REQUEST: query='{query}', index.ntotal={index.ntotal}, texts_count={len(texts)}")
+
     if not query.strip():
         return jsonify({'error': 'Empty query string.'}), 400
 
     if index.ntotal == 0 or len(texts) == 0:
+        print("ERROR: Empty index or texts. Returning empty result.")
         return jsonify({'results': [], 'message': 'No data in index.'}), 200
 
     embedding = np.array(model.embed([query])).astype('float32')
-    D, I = index.search(embedding, min(k, index.ntotal))
 
-    results = []
-    for idx in I[0]:
-        if 0 <= idx < len(texts):
-            results.append(texts[idx])
-
-    return jsonify({'results': results})
-
+    try:
+        D, I = index.search(embedding, min(k, index.ntotal))
+        results = [texts[i] for i in I[0] if 0 <= i < len(texts)]
+        return jsonify({'results': results})
+    except Exception as e:
+        print(f"SEARCH ERROR: {e}")
+        return jsonify({'error': 'Vector search failed.', 'details': str(e)}), 500
+    
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'OK', 'vectors_in_index': index.ntotal, 'texts': len(texts)})
+    return jsonify({
+        'status': 'OK',
+        'vectors_in_index': index.ntotal,
+        'texts_stored': len(texts)
+    })
+
+
 
 if __name__ == '__main__':
     serve(app, host='0.0.0.0', port=5001)
