@@ -55,12 +55,16 @@ def search():
     if not query.strip():
         return jsonify({'error': 'Empty query string.'}), 400
 
-    embedding = np.array(model.embed([query])).astype('float32')
-    D, I = index.search(embedding, k)
+    if index.ntotal == 0 or len(texts) == 0:
+        return jsonify({'results': [], 'message': 'No data available in index.'})
 
-    results = [texts[i] for i in I[0] if i < len(texts)]
+    embedding = np.array(model.embed([query])).astype('float32')
+    D, I = index.search(embedding, min(k, index.ntotal))
+
+    results = [texts[i] for i in I[0] if 0 <= i < len(texts)]
 
     return jsonify({'results': results})
+
 
 if __name__ == '__main__':
     serve(app, host='0.0.0.0', port=5001)
