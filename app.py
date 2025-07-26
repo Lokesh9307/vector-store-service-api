@@ -90,4 +90,4 @@ def health():
     return jsonify({'status': 'OK', 'vectors_in_index': index.ntotal, 'texts_stored': total_chunks})
 
 if __name__ == '__main__':
-    serve(app, host='0.0.0.0', port=5001)
+    serve(app, host='0.0.0.0', port=8080)

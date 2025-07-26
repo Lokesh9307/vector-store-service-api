@@ -29,7 +29,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Expose port (match with `serve(..., port=5001)`)
-EXPOSE 5001
+EXPOSE 8080
 
 # Start the app using waitress
 CMD ["python", "app.py"]
