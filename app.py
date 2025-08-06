@@ -5,13 +5,15 @@ from typing import List
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import faiss
 import numpy as np
 from fastembed import TextEmbedding
 from contextlib import contextmanager
 import pdfplumber
 from starlette.responses import JSONResponse
 import tempfile
+import psutil
+import time
+import chromadb
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -29,16 +31,20 @@ app.add_middleware(
 )
 
 # Environment variables
-INDEX_FILE = os.getenv("INDEX_FILE", "vector.index")
 DB_FILE = os.getenv("DB_FILE", "chunks.db")
 MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", 500))
 PORT = int(os.getenv("PORT", 8080))
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
-CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 1000))  # Characters per chunk
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 1000))
+SUB_BATCH_SIZE = int(os.getenv("SUB_BATCH_SIZE", 10))
+MAX_PAYLOAD_SIZE = int(os.getenv("MAX_PAYLOAD_SIZE", 300000))
 
 # Initialize embedding model
 model = TextEmbedding(EMBEDDING_MODEL)
-embedding_dim = len(list(model.embed(["test"]))[0])
+
+# Initialize ChromaDB in-memory
+client = chromadb.Client()
+collection = client.get_or_create_collection(name="chunks")
 
 # SQLite connection pool
 conn = sqlite3.connect(DB_FILE, check_same_thread=False, isolation_level=None)
@@ -53,12 +59,6 @@ CREATE TABLE IF NOT EXISTS chunks (
 )
 ''')
 conn.commit()
-
-# FAISS index
-if os.path.exists(INDEX_FILE):
-    index = faiss.read_index(INDEX_FILE)
-else:
-    index = faiss.IndexFlatL2(embedding_dim)
 
 # SQLite context manager
 @contextmanager
@@ -98,10 +98,20 @@ def split_text_into_chunks(text: str, chunk_size: int) -> List[str]:
         chunks.append(text[i:i + chunk_size])
     return chunks
 
+def log_memory_usage(stage: str):
+    """Log current memory usage in MiB."""
+    process = psutil.Process()
+    mem_info = process.memory_info()
+    mem_usage = mem_info.rss / 1024 / 1024
+    logger.info(f"Memory usage at {stage}: {mem_usage:.2f} MiB")
+
 @app.post("/process_pdf")
 async def process_pdf(file: UploadFile = File(...)):
     if not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="File must be a PDF")
+
+    start_time = time.time()
+    log_memory_usage("start of PDF processing")
 
     try:
         # Save PDF temporarily
@@ -109,19 +119,21 @@ async def process_pdf(file: UploadFile = File(...)):
             tmp_file.write(await file.read())
             tmp_file_path = tmp_file.name
 
+        log_memory_usage("after PDF upload")
+
         # Extract text from PDF
         chunks = []
         with pdfplumber.open(tmp_file_path) as pdf:
             for page in pdf.pages:
                 text = page.extract_text()
                 if text:
-                    # Split text into chunks
                     page_chunks = split_text_into_chunks(text, CHUNK_SIZE)
                     chunks.extend(page_chunks)
 
         # Delete the temporary PDF file
         os.remove(tmp_file_path)
         logger.info(f"Deleted temporary PDF file: {tmp_file_path}")
+        log_memory_usage("after PDF text extraction")
 
         if not chunks:
             raise HTTPException(status_code=400, detail="No text extracted from PDF")
@@ -130,25 +142,27 @@ async def process_pdf(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail=f"Number of chunks ({len(chunks)}) exceeds maximum of {MAX_BATCH_SIZE}")
 
         # Generate embeddings in smaller batches
-        batch_size = 50
         embeddings = []
-        for i in range(0, len(chunks), batch_size):
-            batch = chunks[i:i + batch_size]
-            embeddings.extend(model.embed(batch))
+        for i in range(0, len(chunks), SUB_BATCH_SIZE):
+            batch = chunks[i:i + SUB_BATCH_SIZE]
+            batch_embeddings = list(model.embed(batch))
+            embeddings.extend(batch_embeddings)
+            log_memory_usage(f"after embedding batch {i//SUB_BATCH_SIZE + 1}")
+            batch_embeddings = None
 
-        # Add to FAISS index
-        index.add(np.array(embeddings).astype('float32'))
-
-        # Store chunks in SQLite
+        # Add to ChromaDB
         ids = store_texts(chunks)
+        collection.add(
+            documents=chunks,
+            embeddings=embeddings,
+            ids=[str(id) for id in ids]
+        )
+        log_memory_usage("after ChromaDB insert")
 
-        # Save FAISS index
-        faiss.write_index(index, INDEX_FILE)
-
-        logger.info(f"Processed PDF and added {len(ids)} chunks to index and database")
+        processing_time = time.time() - start_time
+        logger.info(f"Processed PDF and added {len(ids)} chunks in {processing_time:.2f} seconds")
         return {"status": "pdf processed", "added_count": len(ids)}
     except Exception as e:
-        # Ensure temporary file is deleted in case of error
         if 'tmp_file_path' in locals():
             try:
                 os.remove(tmp_file_path)
@@ -159,7 +173,11 @@ async def process_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/add_chunks")
-async def add_chunks(data: AddChunksRequest):
+async def add_chunks(data: AddChunksRequest, request: Request):
+    content_length = int(request.headers.get("content-length", 0))
+    if content_length > MAX_PAYLOAD_SIZE:
+        raise HTTPException(status_code=400, detail=f"Payload size ({content_length} bytes) exceeds maximum of {MAX_PAYLOAD_SIZE} bytes")
+
     chunks = data.chunks
     if not chunks:
         raise HTTPException(status_code=400, detail="Empty chunk list")
@@ -167,24 +185,29 @@ async def add_chunks(data: AddChunksRequest):
     if len(chunks) > MAX_BATCH_SIZE:
         raise HTTPException(status_code=400, detail=f"Batch size exceeds maximum of {MAX_BATCH_SIZE}")
 
+    start_time = time.time()
+    log_memory_usage("start of add_chunks")
+
     try:
-        # Generate embeddings in smaller batches
-        batch_size = 50
         embeddings = []
-        for i in range(0, len(chunks), batch_size):
-            batch = chunks[i:i + batch_size]
-            embeddings.extend(model.embed(batch))
+        for i in range(0, len(chunks), SUB_BATCH_SIZE):
+            batch = chunks[i:i + SUB_BATCH_SIZE]
+            batch_embeddings = list(model.embed(batch))
+            embeddings.extend(batch_embeddings)
+            log_memory_usage(f"after embedding batch {i//SUB_BATCH_SIZE + 1}")
+            batch_embeddings = None
         
-        # Add to FAISS index
-        index.add(np.array(embeddings).astype('float32'))
-
-        # Store chunks in SQLite
+        # Add to ChromaDB
         ids = store_texts(chunks)
+        collection.add(
+            documents=chunks,
+            embeddings=embeddings,
+            ids=[str(id) for id in ids]
+        )
+        log_memory_usage("after ChromaDB insert")
 
-        # Save FAISS index
-        faiss.write_index(index, INDEX_FILE)
-
-        logger.info(f"Added {len(ids)} chunks to index and database")
+        processing_time = time.time() - start_time
+        logger.info(f"Added {len(ids)} chunks to index and database in {processing_time:.2f} seconds")
         return {"status": "chunks added", "added_count": len(ids)}
     except Exception as e:
         logger.error(f"Error adding chunks: {e}")
@@ -198,13 +221,13 @@ async def search(data: SearchRequest):
     if not query.strip():
         raise HTTPException(status_code=400, detail="Empty query string")
 
-    if index.ntotal == 0:
-        return {"results": [], "message": "No data available in index"}
-
     try:
-        embedding = np.array(list(model.embed([query]))).astype('float32')
-        D, I = index.search(embedding, min(top_k, index.ntotal))
-        ids = [int(idx) + 1 for idx in I[0]]
+        embedding = list(model.embed([query]))[0]
+        results = collection.query(
+            query_embeddings=[embedding],
+            n_results=min(top_k, collection.count())
+        )
+        ids = [int(id) for id in results["ids"][0]]
         results = fetch_texts_by_ids(ids)
 
         logger.info(f"Search completed for query with {len(results)} results")
@@ -220,7 +243,7 @@ async def health():
             total_chunks = cur.execute('SELECT COUNT(*) FROM chunks').fetchone()[0]
         return {
             "status": "OK",
-            "vectors_in_index": index.ntotal,
+            "vectors_in_index": collection.count(),
             "texts_stored": total_chunks
         }
     except Exception as e:
