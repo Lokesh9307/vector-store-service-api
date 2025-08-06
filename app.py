@@ -2,14 +2,16 @@ import os
 import sqlite3
 import logging
 from typing import List
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import faiss
 import numpy as np
 from fastembed import TextEmbedding
 from contextlib import contextmanager
+import pdfplumber
 from starlette.responses import JSONResponse
+import tempfile
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -20,18 +22,19 @@ app = FastAPI()
 # Add CORS middleware to allow all origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allow all HTTP methods (GET, POST, etc.)
-    allow_headers=["*"],  # Allow all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Environment variables
 INDEX_FILE = os.getenv("INDEX_FILE", "vector.index")
 DB_FILE = os.getenv("DB_FILE", "chunks.db")
-MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", 100))
+MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", 500))
 PORT = int(os.getenv("PORT", 8080))
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 1000))  # Characters per chunk
 
 # Initialize embedding model
 model = TextEmbedding(EMBEDDING_MODEL)
@@ -87,6 +90,73 @@ def fetch_texts_by_ids(ids: List[int]) -> List[str]:
         placeholders = ','.join(['?'] * len(ids))
         cur.execute(f'SELECT text FROM chunks WHERE id IN ({placeholders})', ids)
         return [row[0] for row in cur.fetchall()]
+
+def split_text_into_chunks(text: str, chunk_size: int) -> List[str]:
+    """Split text into chunks of approximately chunk_size characters."""
+    chunks = []
+    for i in range(0, len(text), chunk_size):
+        chunks.append(text[i:i + chunk_size])
+    return chunks
+
+@app.post("/process_pdf")
+async def process_pdf(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="File must be a PDF")
+
+    try:
+        # Save PDF temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file.write(await file.read())
+            tmp_file_path = tmp_file.name
+
+        # Extract text from PDF
+        chunks = []
+        with pdfplumber.open(tmp_file_path) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text()
+                if text:
+                    # Split text into chunks
+                    page_chunks = split_text_into_chunks(text, CHUNK_SIZE)
+                    chunks.extend(page_chunks)
+
+        # Delete the temporary PDF file
+        os.remove(tmp_file_path)
+        logger.info(f"Deleted temporary PDF file: {tmp_file_path}")
+
+        if not chunks:
+            raise HTTPException(status_code=400, detail="No text extracted from PDF")
+
+        if len(chunks) > MAX_BATCH_SIZE:
+            raise HTTPException(status_code=400, detail=f"Number of chunks ({len(chunks)}) exceeds maximum of {MAX_BATCH_SIZE}")
+
+        # Generate embeddings in smaller batches
+        batch_size = 50
+        embeddings = []
+        for i in range(0, len(chunks), batch_size):
+            batch = chunks[i:i + batch_size]
+            embeddings.extend(model.embed(batch))
+
+        # Add to FAISS index
+        index.add(np.array(embeddings).astype('float32'))
+
+        # Store chunks in SQLite
+        ids = store_texts(chunks)
+
+        # Save FAISS index
+        faiss.write_index(index, INDEX_FILE)
+
+        logger.info(f"Processed PDF and added {len(ids)} chunks to index and database")
+        return {"status": "pdf processed", "added_count": len(ids)}
+    except Exception as e:
+        # Ensure temporary file is deleted in case of error
+        if 'tmp_file_path' in locals():
+            try:
+                os.remove(tmp_file_path)
+                logger.info(f"Deleted temporary PDF file due to error: {tmp_file_path}")
+            except:
+                pass
+        logger.error(f"Error processing PDF: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/add_chunks")
 async def add_chunks(data: AddChunksRequest):
