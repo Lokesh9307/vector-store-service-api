@@ -1,5 +1,6 @@
-flask
-faiss-cpu
-numpy
-fastembed
-waitress
+fastapi==0.115.0
+uvicorn==0.30.6
+gunicorn==22.0.0
+faiss-cpu==1.8.0
+numpy==1.26.4
+fastembed==0.3.6

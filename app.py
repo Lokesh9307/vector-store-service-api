@@ -1,30 +1,38 @@
-from waitress import serve
-from flask import Flask, request, jsonify
-import faiss
-import numpy as np
-import fastembed
 import os
 import sqlite3
-import json
+import logging
+from typing import List
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+import faiss
+import numpy as np
+from fastembed import TextEmbedding
+from contextlib import contextmanager
+from starlette.responses import JSONResponse
 
-app = Flask(__name__)
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-model = fastembed.TextEmbedding('BAAI/bge-small-en-v1.5')
+app = FastAPI()
+
+# Environment variables
+INDEX_FILE = os.getenv("INDEX_FILE", "vector.index")
+DB_FILE = os.getenv("DB_FILE", "chunks.db")
+MAX_BATCH_SIZE = int(os.getenv("MAX_BATCH_SIZE", 100))
+PORT = int(os.getenv("PORT", 8080))
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+
+# Initialize embedding model
+model = TextEmbedding(EMBEDDING_MODEL)
 embedding_dim = len(list(model.embed(["test"]))[0])
 
-# Paths
-INDEX_FILE = "vector.index"
-DB_FILE = "chunks.db"
-
-# Load or create FAISS index
-if os.path.exists(INDEX_FILE):
-    index = faiss.read_index(INDEX_FILE)
-else:
-    index = faiss.IndexFlatL2(embedding_dim)
-
-# SQLite setup
-conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+# SQLite connection pool
+conn = sqlite3.connect(DB_FILE, check_same_thread=False, isolation_level=None)
+conn.execute("PRAGMA journal_mode=WAL")
 cursor = conn.cursor()
+
+# Create table
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS chunks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -33,61 +41,120 @@ CREATE TABLE IF NOT EXISTS chunks (
 ''')
 conn.commit()
 
-def store_texts(chunks):
-    cursor.executemany('INSERT INTO chunks (text) VALUES (?)', [(chunk,) for chunk in chunks])
-    conn.commit()
-    ids = cursor.execute('SELECT last_insert_rowid()').fetchone()[0]
-    start_id = ids - len(chunks) + 1
-    return list(range(start_id, ids + 1))
+# FAISS index
+if os.path.exists(INDEX_FILE):
+    index = faiss.read_index(INDEX_FILE)
+else:
+    index = faiss.IndexFlatL2(embedding_dim)
 
-def fetch_texts_by_ids(ids):
-    placeholders = ','.join(['?'] * len(ids))
-    cursor.execute(f'SELECT text FROM chunks WHERE id IN ({placeholders})', ids)
-    return [row[0] for row in cursor.fetchall()]
+# SQLite context manager
+@contextmanager
+def get_db_cursor():
+    try:
+        yield cursor
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"Database error: {e}")
+        raise
 
-@app.route('/add_chunks', methods=['POST'])
-def add_chunks():
-    data = request.json
-    chunks = data.get('chunks', [])
+class AddChunksRequest(BaseModel):
+    chunks: List[str]
 
-    if not isinstance(chunks, list) or not all(isinstance(chunk, str) for chunk in chunks):
-        return jsonify({'error': 'Invalid input. Expected list of strings.'}), 400
+class SearchRequest(BaseModel):
+    query: str
+    top_k: int = 3
 
-    # Generate embeddings
-    embeddings = list(model.embed(chunks))
-    index.add(np.array(embeddings).astype('float32'))
+def store_texts(chunks: List[str]) -> List[int]:
+    with get_db_cursor() as cur:
+        cur.executemany('INSERT INTO chunks (text) VALUES (?)', [(chunk,) for chunk in chunks])
+        last_id = cur.execute('SELECT last_insert_rowid()').fetchone()[0]
+        start_id = last_id - len(chunks) + 1
+        return list(range(start_id, last_id + 1))
 
-    # Store chunks in SQLite
-    ids = store_texts(chunks)
+def fetch_texts_by_ids(ids: List[int]) -> List[str]:
+    with get_db_cursor() as cur:
+        placeholders = ','.join(['?'] * len(ids))
+        cur.execute(f'SELECT text FROM chunks WHERE id IN ({placeholders})', ids)
+        return [row[0] for row in cur.fetchall()]
 
-    # Save index after batch
-    faiss.write_index(index, INDEX_FILE)
+@app.post("/add_chunks")
+async def add_chunks(data: AddChunksRequest):
+    chunks = data.chunks
+    if not chunks:
+        raise HTTPException(status_code=400, detail="Empty chunk list")
+    
+    if len(chunks) > MAX_BATCH_SIZE:
+        raise HTTPException(status_code=400, detail=f"Batch size exceeds maximum of {MAX_BATCH_SIZE}")
 
-    return jsonify({'status': 'chunks added', 'added_count': len(ids)})
+    try:
+        # Generate embeddings in smaller batches
+        batch_size = 50
+        embeddings = []
+        for i in range(0, len(chunks), batch_size):
+            batch = chunks[i:i + batch_size]
+            embeddings.extend(model.embed(batch))
+        
+        # Add to FAISS index
+        index.add(np.array(embeddings).astype('float32'))
 
-@app.route('/search', methods=['POST'])
-def search():
-    query = request.json.get('query', '')
-    k = int(request.json.get('top_k', 3))
+        # Store chunks in SQLite
+        ids = store_texts(chunks)
+
+        # Save FAISS index
+        faiss.write_index(index, INDEX_FILE)
+
+        logger.info(f"Added {len(ids)} chunks to index and database")
+        return {"status": "chunks added", "added_count": len(ids)}
+    except Exception as e:
+        logger.error(f"Error adding chunks: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/search")
+async def search(data: SearchRequest):
+    query = data.query
+    top_k = data.top_k
 
     if not query.strip():
-        return jsonify({'error': 'Empty query string.'}), 400
+        raise HTTPException(status_code=400, detail="Empty query string")
 
     if index.ntotal == 0:
-        return jsonify({'results': [], 'message': 'No data available in index.'}), 200
+        return {"results": [], "message": "No data available in index"}
 
-    embedding = np.array(list(model.embed([query]))).astype('float32')
-    D, I = index.search(embedding, min(k, index.ntotal))
+    try:
+        embedding = np.array(list(model.embed([query]))).astype('float32')
+        D, I = index.search(embedding, min(top_k, index.ntotal))
+        ids = [int(idx) + 1 for idx in I[0]]
+        results = fetch_texts_by_ids(ids)
 
-    ids = [int(idx) + 1 for idx in I[0]]  # SQLite rowid starts from 1
-    results = fetch_texts_by_ids(ids)
+        logger.info(f"Search completed for query with {len(results)} results")
+        return {"results": results}
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return jsonify({'results': results})
+@app.get("/health")
+async def health():
+    try:
+        with get_db_cursor() as cur:
+            total_chunks = cur.execute('SELECT COUNT(*) FROM chunks').fetchone()[0]
+        return {
+            "status": "OK",
+            "vectors_in_index": index.ntotal,
+            "texts_stored": total_chunks
+        }
+    except Exception as e:
+        logger.error(f"Health check error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/health', methods=['GET'])
-def health():
-    total_chunks = cursor.execute('SELECT COUNT(*) FROM chunks').fetchone()[0]
-    return jsonify({'status': 'OK', 'vectors_in_index': index.ntotal, 'texts_stored': total_chunks})
+# Custom middleware to log request start and end
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger.info(f"Received {request.method} request to {request.url.path}")
+    response = await call_next(request)
+    logger.info(f"Completed {request.method} request to {request.url.path}")
+    return response
 
-if __name__ == '__main__':
-    serve(app, host='0.0.0.0', port=8080)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT, workers=1)

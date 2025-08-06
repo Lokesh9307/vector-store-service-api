@@ -1,6 +1,5 @@
-# Use an official Python base image
+# Use a lightweight Python base image
 FROM python:3.10-slim
-
 
 # Set work directory
 WORKDIR /app
@@ -12,24 +11,17 @@ RUN apt-get update && apt-get install -y \
     libsm6 \
     libxrender1 \
     libxext6 \
-    wget \
-    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install faiss-cpu via pip
-RUN pip install --no-cache-dir faiss-cpu
-
-# Copy your requirements (if you have one)
-COPY requirements.txt .
-
 # Install Python dependencies
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy your app
+# Copy application files
 COPY . .
 
-# Expose port (match with `serve(..., port=5001)`)
+# Expose port
 EXPOSE 8080
 
-# Start the app using waitress
-CMD ["python", "app.py"]
+# Start the app with gunicorn and uvicorn
+CMD ["gunicorn", "--worker-class", "uvicorn.workers.UvicornWorker", "--workers", "1", "--bind", "0.0.0.0:8080", "app:app"]
