@@ -1,4 +1,30 @@
+# Python virtual environment
+venv/
 .env
-venv
-__pycache__
+__pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+env/
+.venv/
+
+# Database and temporary files
+chunks.db
+*.index
+*.parquet
+*.duckdb
+*.tmp
+/tmp/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs and build artifacts
+*.log
+dist/
+build/
+*.egg-info
