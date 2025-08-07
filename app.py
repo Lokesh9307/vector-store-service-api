@@ -21,7 +21,7 @@ app = FastAPI()
 
 # CORS
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*","https://superllm.vercel.app","http://localhost:3000"], allow_credentials=True,
+    CORSMiddleware, allow_origins=["*","https://pdfchatbot-api-117429664165.europe-west1.run.app"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"]
 )
 
@@ -172,24 +172,27 @@ async def search(data: SearchRequest):
         raise HTTPException(400, "Empty query")
 
     try:
-        # Safely convert embedding generator to list
-        embedding = list(model.embed([query]))[0]
+        # Embed the query and convert to native list
+        raw_embedding = list(model.embed([query]))[0]
+        embedding = raw_embedding.tolist()  # Convert ndarray to Python list
 
+        # Perform search with properly formatted embedding
         results = collection.query(
             query_embeddings=[embedding],
             n_results=min(data.top_k, collection.count())
         )
 
-        ids = list(results["ids"][0])
-        ids = [int(i) for i in ids]
+        # Convert IDs to int list
+        ids = [int(i) for i in list(results["ids"][0])]
         texts = fetch_texts_by_ids(ids)
 
-        logger.info(f"Search complete: {len(texts)} results")
+        logger.info(f"Search completed: {len(texts)} hits")
         return {"results": texts}
 
     except Exception as e:
         logger.error(f"Search error: {e}")
         raise HTTPException(500, str(e))
+
 
 @app.get("/health")
 async def health():
