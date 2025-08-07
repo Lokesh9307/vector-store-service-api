@@ -92,18 +92,20 @@ def fetch_texts_by_ids(ids: List[int]) -> List[str]:
         return [row[0] for row in cur.fetchall()]
 
 def split_text_into_chunks(text: str, chunk_size: int) -> List[str]:
-    """Split text into chunks of approximately chunk_size characters."""
-    chunks = []
-    for i in range(0, len(text), chunk_size):
-        chunks.append(text[i:i + chunk_size])
-    return chunks
+    return [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
 
 def log_memory_usage(stage: str):
-    """Log current memory usage in MiB."""
-    process = psutil.Process()
-    mem_info = process.memory_info()
-    mem_usage = mem_info.rss / 1024 / 1024
+    mem_usage = psutil.Process().memory_info().rss / 1024 / 1024
     logger.info(f"Memory usage at {stage}: {mem_usage:.2f} MiB")
+
+def embed_chunks(chunks: List[str]) -> List[List[float]]:
+    embeddings = []
+    for i in range(0, len(chunks), SUB_BATCH_SIZE):
+        batch = chunks[i:i + SUB_BATCH_SIZE]
+        batch_embeddings = model.embed(batch)
+        embeddings.extend([e.tolist() for e in batch_embeddings])
+        log_memory_usage(f"after embedding batch {i // SUB_BATCH_SIZE + 1}")
+    return embeddings
 
 @app.post("/process_pdf")
 async def process_pdf(file: UploadFile = File(...)):
@@ -114,23 +116,19 @@ async def process_pdf(file: UploadFile = File(...)):
     log_memory_usage("start of PDF processing")
 
     try:
-        # Save PDF temporarily
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
             tmp_file.write(await file.read())
             tmp_file_path = tmp_file.name
 
         log_memory_usage("after PDF upload")
 
-        # Extract text from PDF
         chunks = []
         with pdfplumber.open(tmp_file_path) as pdf:
             for page in pdf.pages:
                 text = page.extract_text()
                 if text:
-                    page_chunks = split_text_into_chunks(text, CHUNK_SIZE)
-                    chunks.extend(page_chunks)
+                    chunks.extend(split_text_into_chunks(text, CHUNK_SIZE))
 
-        # Delete the temporary PDF file
         os.remove(tmp_file_path)
         logger.info(f"Deleted temporary PDF file: {tmp_file_path}")
         log_memory_usage("after PDF text extraction")
@@ -141,22 +139,10 @@ async def process_pdf(file: UploadFile = File(...)):
         if len(chunks) > MAX_BATCH_SIZE:
             raise HTTPException(status_code=400, detail=f"Number of chunks ({len(chunks)}) exceeds maximum of {MAX_BATCH_SIZE}")
 
-        # Generate embeddings in smaller batches
-        embeddings = []
-        for i in range(0, len(chunks), SUB_BATCH_SIZE):
-            batch = chunks[i:i + SUB_BATCH_SIZE]
-            batch_embeddings = list(model.embed(batch))
-            embeddings.extend(batch_embeddings)
-            log_memory_usage(f"after embedding batch {i//SUB_BATCH_SIZE + 1}")
-            batch_embeddings = None
+        embeddings = embed_chunks(chunks)
 
-        # Add to ChromaDB
         ids = store_texts(chunks)
-        collection.add(
-            documents=chunks,
-            embeddings=embeddings,
-            ids=[str(id) for id in ids]
-        )
+        collection.add(documents=chunks, embeddings=embeddings, ids=[str(id) for id in ids])
         log_memory_usage("after ChromaDB insert")
 
         processing_time = time.time() - start_time
@@ -181,7 +167,7 @@ async def add_chunks(data: AddChunksRequest, request: Request):
     chunks = data.chunks
     if not chunks:
         raise HTTPException(status_code=400, detail="Empty chunk list")
-    
+
     if len(chunks) > MAX_BATCH_SIZE:
         raise HTTPException(status_code=400, detail=f"Batch size exceeds maximum of {MAX_BATCH_SIZE}")
 
@@ -189,21 +175,9 @@ async def add_chunks(data: AddChunksRequest, request: Request):
     log_memory_usage("start of add_chunks")
 
     try:
-        embeddings = []
-        for i in range(0, len(chunks), SUB_BATCH_SIZE):
-            batch = chunks[i:i + SUB_BATCH_SIZE]
-            batch_embeddings = list(model.embed(batch))
-            embeddings.extend(batch_embeddings)
-            log_memory_usage(f"after embedding batch {i//SUB_BATCH_SIZE + 1}")
-            batch_embeddings = None
-        
-        # Add to ChromaDB
+        embeddings = embed_chunks(chunks)
         ids = store_texts(chunks)
-        collection.add(
-            documents=chunks,
-            embeddings=embeddings,
-            ids=[str(id) for id in ids]
-        )
+        collection.add(documents=chunks, embeddings=embeddings, ids=[str(id) for id in ids])
         log_memory_usage("after ChromaDB insert")
 
         processing_time = time.time() - start_time
@@ -215,23 +189,14 @@ async def add_chunks(data: AddChunksRequest, request: Request):
 
 @app.post("/search")
 async def search(data: SearchRequest):
-    query = data.query
-    top_k = data.top_k
-
-    if not query.strip():
+    if not data.query.strip():
         raise HTTPException(status_code=400, detail="Empty query string")
 
     try:
-        embedding = list(model.embed([query]))[0]
-        results = collection.query(
-            query_embeddings=[embedding],
-            n_results=min(top_k, collection.count())
-        )
+        embedding = model.embed([data.query])[0].tolist()
+        results = collection.query(query_embeddings=[embedding], n_results=min(data.top_k, collection.count()))
         ids = [int(id) for id in results["ids"][0]]
-        results = fetch_texts_by_ids(ids)
-
-        logger.info(f"Search completed for query with {len(results)} results")
-        return {"results": results}
+        return {"results": fetch_texts_by_ids(ids)}
     except Exception as e:
         logger.error(f"Search error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -250,7 +215,6 @@ async def health():
         logger.error(f"Health check error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# Custom middleware to log request start and end
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     logger.info(f"Received {request.method} request to {request.url.path}")
